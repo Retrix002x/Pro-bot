@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Your license key</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #0d0d14; color: #eee; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    .box { text-align: center; max-width: 480px; padding: 2rem; }
+    .key { font-family: monospace; font-size: 1.1rem; background: #1a1a24; border: 1px solid #7c3aed; border-radius: 8px; padding: 1rem; margin: 1.5rem 0; user-select: all; word-break: break-all; }
+    button { background: #7c3aed; color: white; border: none; padding: 0.6rem 1.2rem; border-radius: 8px; font-weight: 600; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>Here's your key</h1>
+    <p>Paste this into the app when it asks for your license key.</p>
+    <div class="key" id="key">{{ key }}</div>
+    <button onclick="navigator.clipboard.writeText(document.getElementById('key').innerText)">Copy key</button>
+  </div>
+</body>
+</html>
