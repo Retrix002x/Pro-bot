@@ -198,7 +198,11 @@ def create_expiring_license(puid):
         "notes": "Auto-issued after LootLabs task completion.",
         "expirationDate": expires_at.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
     }
-    headers = {"Authorization": f"Bearer {(LICENSEGATE_API_KEY or '').strip()}"}
+    # LicenseGate's own OpenAPI spec defines this as an `apiKey`-type security
+    # scheme (name: Authorization, in: header) -- NOT an http/bearer scheme.
+    # That means the raw key goes directly in the header, with no "Bearer "
+    # prefix. Confirmed against open-api.json in the LicenseGate repo.
+    headers = {"Authorization": (LICENSEGATE_API_KEY or "").strip()}
 
     try:
         resp = requests.post(LICENSEGATE_ADMIN_CREATE_URL, json=payload, headers=headers, timeout=15)
