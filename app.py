@@ -259,6 +259,62 @@ def create_expiring_license(puid):
     return data["licenseKey"], data["expirationDate"]
 
 
+LICENSEGATE_ADMIN_LIST_URL = os.environ.get(
+    "LICENSEGATE_ADMIN_LIST_URL", "https://api.licensegate.io/admin/licenses"
+)
+# Keep expired auto-issued keys around a bit past their actual expiry before
+# deleting them -- just a small buffer in case you ever need to glance at a
+# recently-expired one while troubleshooting a user's report.
+CLEANUP_GRACE_HOURS = 24
+
+
+def cleanup_expired_auto_issued_licenses():
+    """Deletes old, expired, auto-issued licenses from LicenseGate to keep
+    the dashboard from growing forever. Deliberately narrow: a license is
+    only ever a cleanup candidate if BOTH of these are true --
+      1. its name starts with "lootlabs-" (exactly how create_expiring_license
+         names every key it mints -- see the payload above), and
+      2. its expirationDate has passed by more than CLEANUP_GRACE_HOURS.
+    A manually-created key -- e.g. a permanent personal key with no
+    expirationDate at all, or any key not named lootlabs-* -- can never
+    satisfy both conditions and is therefore never touched, regardless of
+    its own expiration status. Best-effort: failures here are logged and
+    swallowed, never allowed to break the actual /claim response that
+    triggered this."""
+    headers = {"Authorization": (LICENSEGATE_API_KEY or "").strip()}
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=CLEANUP_GRACE_HOURS)
+
+    try:
+        resp = requests.get(LICENSEGATE_ADMIN_LIST_URL, headers=headers, timeout=15)
+        resp.raise_for_status()
+        licenses = resp.json().get("licenses", [])
+    except Exception as e:
+        print(f"[dispenser] cleanup: could not list licenses, skipping this round: {e}")
+        return
+
+    for lic in licenses:
+        name = lic.get("name") or ""
+        exp_str = lic.get("expirationDate")
+        if not name.startswith("lootlabs-") or not exp_str:
+            continue  # not an auto-issued key, or has no expiration at all -- never touch
+
+        try:
+            exp_dt = datetime.strptime(exp_str, "%Y-%m-%dT%H:%M:%S.000Z").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue  # unexpected date format -- skip rather than guess
+
+        if exp_dt >= cutoff:
+            continue  # not expired long enough yet
+
+        lic_id = lic.get("id")
+        try:
+            del_resp = requests.delete(f"{LICENSEGATE_ADMIN_LIST_URL}/{lic_id}", headers=headers, timeout=15)
+            if del_resp.status_code not in (200, 204):
+                print(f"[dispenser] cleanup: failed to delete license id={lic_id} ({del_resp.status_code}): {del_resp.text}")
+        except Exception as e:
+            print(f"[dispenser] cleanup: error deleting license id={lic_id}: {e}")
+
+
 # ---------------------------------------------------------------------------
 # /start -- issue a puid, send the visitor into the LootLabs flow
 # ---------------------------------------------------------------------------
@@ -373,6 +429,15 @@ def claim():
             "UPDATE claims SET claimed_key = ?, claimed_key_expires_at = ?, claimed_at = ? WHERE puid = ?",
             (key, expires_at, int(time.time()), puid),
         )
+
+    # Best-effort tidy-up of old expired auto-issued keys -- outside the
+    # transaction above so this network round-trip doesn't hold the SQLite
+    # lock, and wrapped so a cleanup hiccup can never affect the key the
+    # user is about to receive.
+    try:
+        cleanup_expired_auto_issued_licenses()
+    except Exception as e:
+        print(f"[dispenser] cleanup: unexpected error, ignoring: {e}")
 
     return render_template("success.html", key=key, expires_at=expires_at)
 
