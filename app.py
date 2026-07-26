@@ -78,7 +78,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import requests
-from flask import Flask, request, redirect, render_template, make_response, abort
+from flask import Flask, request, redirect, render_template, make_response, abort, jsonify
 
 app = Flask(__name__)
 
@@ -93,6 +93,11 @@ LICENSEGATE_ADMIN_CREATE_URL = os.environ.get(
     "LICENSEGATE_ADMIN_CREATE_URL", "https://api.licensegate.io/admin/licenses"
 )
 KEY_EXPIRY_HOURS = 24
+# Must exactly match LICENSEGATE_SCOPE in the client's licensing.py -- the
+# client sends this as a ?scope= query param on every /verify call once a
+# license has a scope set, and LicenseGate rejects the call outright
+# (LICENSE_SCOPE_FAILED) if it's missing or doesn't match.
+LICENSE_SCOPE = "clash-bot"
 
 
 def _startup_check():
@@ -170,6 +175,22 @@ def init_db():
             )
             """
         )
+        # One-device-per-key lock. LicenseGate has no first-party HWID
+        # binding (see licensing.py's docstring), so this app plays that
+        # role itself: the first hwid to successfully check a given license
+        # key gets bound to it; every check after that must match, or it's
+        # rejected. Since every key already expires in 24h (a fresh LootLabs
+        # completion is required for a new one), this only needs to hold for
+        # a single key's lifetime -- no unbind/reset flow required.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_bindings (
+                license_key TEXT PRIMARY KEY,
+                hwid TEXT NOT NULL,
+                bound_at INTEGER
+            )
+            """
+        )
         # Migration for a database created before this column existed --
         # harmless no-op on a brand-new database where the CREATE TABLE
         # above already included it.
@@ -197,17 +218,27 @@ def create_expiring_license(puid):
         "name": f"lootlabs-{puid[:16]}",
         "notes": "Auto-issued after LootLabs task completion.",
         "expirationDate": expires_at.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-        # These are documented as nullable-optional (omit for "no restriction"),
-        # but LicenseGate's current (early-access) API defaults any field you
-        # omit to null internally and then fails its own strict type check on
-        # that null -- a server-side bug, not something fixable from our side.
-        # Workaround: send explicit falsy/zero values instead of omitting them,
-        # so they still read as "no restriction" without tripping validation.
-        "ipLimit": 0,
-        "licenseScope": "",
-        "validationPoints": 0,
-        "validationLimit": 0,
-        "replenishAmount": 0,
+        # LicenseGate's early-access API defaults any omitted field to null
+        # internally and then fails its own type check on that default, so
+        # every one of these has to be sent explicitly with a real value --
+        # confirmed via direct curl testing against the live API:
+        #   - ipLimit: generous headroom for one person switching networks
+        #     (WiFi/cellular) -- LicenseGate's own guidance is ~3x expected
+        #     concurrent users in a 12h window; 5 is comfortable for a
+        #     single-person key.
+        #   - licenseScope: must match LICENSE_SCOPE in licensing.py exactly,
+        #     since the client sends this as a query param on every /verify
+        #     call once a license has a scope set.
+        #   - validationPoints MUST equal validationLimit (both 100) --
+        #     validationPoints is the *starting* token balance, not a
+        #     historical counter. Setting it to 0 (an earlier mistake here)
+        #     creates a license that starts already rate-limited and only
+        #     self-heals after a full replenishInterval.
+        "ipLimit": 5,
+        "licenseScope": LICENSE_SCOPE,
+        "validationPoints": 100,
+        "validationLimit": 100,
+        "replenishAmount": 100,
         "replenishInterval": "DAY",
     }
     # LicenseGate's own OpenAPI spec defines this as an `apiKey`-type security
@@ -344,6 +375,43 @@ def claim():
         )
 
     return render_template("success.html", key=key, expires_at=expires_at)
+
+
+# ---------------------------------------------------------------------------
+# /verify-device -- one-device-per-key lock. LicenseGate itself has no
+# first-party HWID binding (only IP Limit, which isn't the same thing --
+# one device can have multiple IPs, and multiple devices can share one).
+# licensing.py calls this BEFORE trusting LicenseGate's own /verify result:
+# the first hwid to check a given key gets bound to it; every check after
+# that must match the same hwid, or it's rejected. Since every key already
+# expires in 24h (a fresh LootLabs completion is required for a new one),
+# this only needs to hold for a single key's lifetime -- no unbind/reset
+# flow is needed.
+# ---------------------------------------------------------------------------
+@app.route("/verify-device")
+def verify_device():
+    key = request.args.get("key", "")
+    hwid = request.args.get("hwid", "")
+    if not key or not hwid:
+        return jsonify({"ok": False, "reason": "missing_parameters"}), 400
+
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")  # serialize concurrent first-uses of the same key
+        row = conn.execute(
+            "SELECT hwid FROM device_bindings WHERE license_key = ?", (key,)
+        ).fetchone()
+
+        if row is None:
+            conn.execute(
+                "INSERT INTO device_bindings (license_key, hwid, bound_at) VALUES (?, ?, ?)",
+                (key, hwid, int(time.time())),
+            )
+            return jsonify({"ok": True, "bound": "first_use"})
+
+        if row["hwid"] == hwid:
+            return jsonify({"ok": True, "bound": "matches"})
+
+        return jsonify({"ok": False, "reason": "device_mismatch"}), 403
 
 
 @app.route("/")
