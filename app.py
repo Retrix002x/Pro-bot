@@ -197,6 +197,18 @@ def create_expiring_license(puid):
         "name": f"lootlabs-{puid[:16]}",
         "notes": "Auto-issued after LootLabs task completion.",
         "expirationDate": expires_at.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        # These are documented as nullable-optional (omit for "no restriction"),
+        # but LicenseGate's current (early-access) API defaults any field you
+        # omit to null internally and then fails its own strict type check on
+        # that null -- a server-side bug, not something fixable from our side.
+        # Workaround: send explicit falsy/zero values instead of omitting them,
+        # so they still read as "no restriction" without tripping validation.
+        "ipLimit": 0,
+        "licenseScope": "",
+        "validationPoints": 0,
+        "validationLimit": 0,
+        "replenishAmount": 0,
+        "replenishInterval": "DAY",
     }
     # LicenseGate's own OpenAPI spec defines this as an `apiKey`-type security
     # scheme (name: Authorization, in: header) -- NOT an http/bearer scheme.
